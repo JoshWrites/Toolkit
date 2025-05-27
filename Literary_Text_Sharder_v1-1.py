@@ -283,22 +283,22 @@ Be specific and avoid generic terms. Only include elements clearly present in th
         windows = self.create_analysis_windows(text)
 
         # Limit the number of windows to analyze for efficiency
-        if len(windows) > max_windows:
+        # if len(windows) > max_windows:
             # Take windows from beginning, middle, and end
-            selected_windows = []
-            selected_windows.extend(windows[:3])  # Beginning
-            mid_point = len(windows) // 2
-            selected_windows.extend(windows[mid_point - 1:mid_point + 2])  # Middle
-            selected_windows.extend(windows[-3:])  # End
+            # selected_windows = []
+            # selected_windows.extend(windows[:3])  # Beginning
+            # mid_point = len(windows) // 2
+            # selected_windows.extend(windows[mid_point - 1:mid_point + 2])  # Middle
+            # selected_windows.extend(windows[-3:])  # End
 
             # Add a few random samples
-            import random
-            remaining = [w for i, w in enumerate(windows) if
-                         i not in [0, 1, 2, mid_point - 1, mid_point, mid_point + 1, -3, -2, -1]]
-            if remaining:
-                selected_windows.extend(random.sample(remaining, min(2, len(remaining))))
+            # import random
+            # remaining = [w for i, w in enumerate(windows) if
+                         # i not in [0, 1, 2, mid_point - 1, mid_point, mid_point + 1, -3, -2, -1]]
+            # if remaining:
+                # selected_windows.extend(random.sample(remaining, min(2, len(remaining))))
 
-            windows = selected_windows
+            # windows = selected_windows
 
         print(f"Analyzing {len(windows)} text windows with Llama 3.2...")
 
@@ -408,49 +408,104 @@ class LiterarySharder:
 
     def create_character_based_shards(self, text: str, characters: Set[str], max_size: int, source_filename: str) -> \
     Dict[str, Dict]:
-        """Create shards based on character appearances, saving each to disk immediately."""
+        """Create shards based on character appearances, writing directly to disk per shard key to minimize RAM."""
+
         shard_info = {}
 
-        # Split text into paragraphs
         paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
 
-        current_shard = []
-        current_size = 0
-        shard_count = 1
+        # Track open shard files and sizes per shard key
+        open_shards = {}  # shard_key -> {'file_handle': f, 'current_size': int, 'shard_count': int}
+
+        def _open_new_shard_file(shard_key: str):
+            count = open_shards.get(shard_key, {}).get('shard_count', 1)
+            shard_name = f"{shard_key}_{count}"
+            safe_name = self._sanitize_name(shard_name)
+            shard_path = os.path.join(self.current_output_dir, f"{safe_name}.txt")
+
+            # Open file for writing (overwrite if exists)
+            f = open(shard_path, 'w', encoding='utf-8')
+            f.write(f"# Literary Shard: {shard_name}\n")
+            f.write(f"# Source: {source_filename}\n")
+            f.write(f"# Created: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+            open_shards[shard_key] = {
+                'file_handle': f,
+                'current_size': 0,
+                'shard_count': count
+            }
+            return f, shard_path, shard_name
+
+        def _close_shard_file(shard_key: str):
+            shard = open_shards.get(shard_key)
+            if not shard:
+                return
+
+            f = shard['file_handle']
+            f.close()
+
+            # Update manifest info
+            shard_path = f.name
+            with open(shard_path, 'r', encoding='utf-8') as file_check:
+                content_text = file_check.read()
+            word_count = len(content_text.split())
+            char_count = len(content_text)
+
+            shard_name = f"{shard_key}_{shard['shard_count']}"
+            shard_info[shard_name] = {
+                'filename': os.path.basename(shard_path),
+                'word_count': word_count,
+                'character_count': char_count,
+                'saved_at': datetime.datetime.now().isoformat()
+            }
+
+            # Remove from open shards
+            del open_shards[shard_key]
 
         for paragraph in paragraphs:
-            # Check which characters appear in this paragraph
+            # Identify characters in paragraph
             paragraph_chars = []
             for char in characters:
                 if char.lower() in paragraph.lower():
                     paragraph_chars.append(char)
 
-            # Determine shard key based on characters present
             if paragraph_chars:
                 shard_key = f"characters_{'_'.join(sorted(paragraph_chars[:2]))}"
             else:
                 shard_key = "no_main_characters"
 
-            # Add to current shard or save and start new one if too large
-            if current_size + len(paragraph) > max_size and current_shard:
-                # Save current shard to disk
-                shard_name = f"{shard_key}_{shard_count}"
-                self._save_shard_to_disk(shard_name, current_shard, source_filename)
-                shard_info[shard_name] = self.shard_manifest[shard_name]
+            # Open file if not open yet for this shard_key
+            if shard_key not in open_shards:
+                _open_new_shard_file(shard_key)
 
-                # Start new shard
-                current_shard = [paragraph]
-                current_size = len(paragraph)
-                shard_count += 1
-            else:
-                current_shard.append(paragraph)
-                current_size += len(paragraph)
+            shard = open_shards[shard_key]
+            f = shard['file_handle']
 
-        # Save final shard
-        if current_shard:
-            shard_name = f"final_section_{shard_count}"
-            self._save_shard_to_disk(shard_name, current_shard, source_filename)
-            shard_info[shard_name] = self.shard_manifest[shard_name]
+            # Estimate paragraph size
+            para_size = len(paragraph)
+
+            # Check if adding this paragraph exceeds max_size
+            if shard['current_size'] + para_size > max_size:
+                # Close current shard file
+                _close_shard_file(shard_key)
+
+                # Increment shard count for next file
+                shard_count = open_shards.get(shard_key, {}).get('shard_count', 1)
+                shard_count = shard_count + 1 if shard_key in open_shards else shard_count + 1
+                open_shards[shard_key] = {'shard_count': shard_count}  # reset entry without file_handle
+
+                # Open new shard file for this shard_key
+                f, _, _ = _open_new_shard_file(shard_key)
+                shard = open_shards[shard_key]
+
+            # Write paragraph and add size
+            f.write(paragraph + "\n\n")
+            shard['current_size'] += para_size
+
+        # Close all remaining open shards at the end
+        keys_to_close = list(open_shards.keys())
+        for key in keys_to_close:
+            _close_shard_file(key)
 
         return shard_info
 
@@ -770,7 +825,7 @@ def display_rich_interface():
             "Please ensure:\n"
             "• Msty is running\n"
             "• Llama 3.2 model is downloaded\n"
-            "• Service is accessible at localhost:11434\n\n"
+            "• Service is accessible at localhost:10000\n\n"
             "The tool will fall back to structural analysis only.",
             title="AI Service Status",
             border_style="red"
