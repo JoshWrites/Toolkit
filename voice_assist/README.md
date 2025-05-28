@@ -78,25 +78,6 @@ Ensure msty.app/Ollama is running locally:
 curl http://localhost:10000/v1/models
 ```
 
-## 🧪 Testing Components
-
-Before running the integrated assistant, test each component individually:
-
-```bash
-# Activate virtual environment
-source voice_assistant_env/bin/activate
-
-# Test components in order (each must pass before proceeding)
-python3 test_audio_system.py          # Audio input/output
-python3 test_speech_to_text.py        # Speech recognition
-python3 test_text_to_speech.py        # Voice synthesis
-python3 test_wake_word.py             # Wake word detection
-python3 test_msty_connection.py       # AI backend connection
-python3 test_router.py                # Query routing logic
-```
-
-**All tests must pass** before running the integrated assistant.
-
 ## 🚀 Usage
 
 ### Start the Voice Assistant
