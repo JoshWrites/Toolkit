@@ -35,9 +35,11 @@ Ziggy prioritizes privacy and local processing:
 
 ## 📦 Installation
 
-### 1. Clone Repository
+### 1. Clone Directory
 ```bash
-git clone <your-repo-url>
+git clone --filter=blob:none --sparse https://github.com/JoshGK8/Toolkit.git
+cd Toolkit
+git sparse-checkout set voice_assist
 cd voice_assist
 ```
 
