@@ -278,7 +278,7 @@ Modify system prompts in `query_ai_local_only()` to customize AI behavior.
 
 ## 📝 License
 
-[Add your preferred license here]
+GPL-3.0 license
 
 ## 🙏 Acknowledgments
 
