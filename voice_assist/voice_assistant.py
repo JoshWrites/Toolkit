@@ -7,7 +7,8 @@ Features:
 - Custom "ziggy" wake word detection using Vosk
 - Smart query routing (local functions vs AI)
 - GPU-accelerated AI responses via msty.app
-- espeak text-to-speech output
+- espeak text-to-speech output with interruption capability
+- Enhanced web search (read results or open browser)
 - Auto-start capability with welcome message
 - "take a break" command to gracefully shutdown
 - Local-first privacy protection
@@ -23,6 +24,9 @@ import time
 import tempfile
 import signal
 import sys
+import threading
+import queue
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -122,18 +126,153 @@ class VoiceAssistant:
             print(f"❌ Setup failed: {e}")
             self.setup_successful = False
 
-    def speak(self, text):
-        """Convert text to speech using espeak"""
+    def speak(self, text, allow_interruption=True):
+        """Convert text to speech with optional interruption capability"""
         try:
             print(f"🗣️ Speaking: {text}")
-            subprocess.run([
-                'espeak',
-                '-s', '150',  # Speed (words per minute)
-                '-v', 'en',  # Voice (English)
-                text
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            if not allow_interruption or len(text) < 100:
+                # Short responses - speak normally without interruption
+                subprocess.run([
+                    'espeak',
+                    '-s', '150',  # Speed (words per minute)
+                    '-v', 'en',  # Voice (English)
+                    text
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return False  # Not interrupted
+
+            # Long responses - enable interruption
+            return self.speak_with_interruption(text)
+
         except Exception as e:
             print(f"Speech error: {e}")
+            return False
+
+    def speak_with_interruption(self, text):
+        """Speak text while listening for 'ziggy' interruption"""
+        try:
+            # Break text into sentences for chunked speaking
+            sentences = self.split_into_sentences(text)
+
+            # Setup interruption detection
+            interruption_queue = queue.Queue()
+            stop_speaking = threading.Event()
+
+            # Start listening for interruption in background
+            listener_thread = threading.Thread(
+                target=self.listen_for_interruption,
+                args=(interruption_queue, stop_speaking)
+            )
+            listener_thread.daemon = True
+            listener_thread.start()
+
+            # Speak each sentence, checking for interruption
+            for i, sentence in enumerate(sentences):
+                if stop_speaking.is_set():
+                    print("🛑 Speech interrupted by wake word")
+                    break
+
+                # Speak this sentence
+                process = subprocess.Popen([
+                    'espeak',
+                    '-s', '150',
+                    '-v', 'en',
+                    sentence.strip()
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                # Wait for sentence to finish, checking for interruption
+                while process.poll() is None:
+                    if stop_speaking.is_set():
+                        process.terminate()
+                        print("🛑 Speech interrupted mid-sentence")
+                        break
+                    time.sleep(0.1)
+
+            # Stop the listener
+            stop_speaking.set()
+
+            # Check if we were interrupted
+            try:
+                interruption_detected = interruption_queue.get_nowait()
+                return True  # Was interrupted
+            except queue.Empty:
+                return False  # Completed normally
+
+        except Exception as e:
+            print(f"Interruptible speech error: {e}")
+            return False
+
+    def listen_for_interruption(self, interruption_queue, stop_event):
+        """Listen for 'ziggy' wake word during speech"""
+        try:
+            # Create a separate recognizer for interruption detection
+            recognizer = vosk.KaldiRecognizer(self.vosk_model, self.sample_rate)
+
+            # Open audio stream for interruption detection
+            stream = self.audio.open(
+                format=self.format,
+                channels=self.channels,
+                rate=self.sample_rate,
+                input=True,
+                frames_per_buffer=self.chunk_size
+            )
+
+            print("👂 Listening for interruption...")
+
+            while not stop_event.is_set():
+                try:
+                    data = stream.read(self.chunk_size, exception_on_overflow=False)
+
+                    if recognizer.AcceptWaveform(data):
+                        result = json.loads(recognizer.Result())
+                        if result.get('text'):
+                            transcript = result['text'].lower().strip()
+
+                            # Check for wake word
+                            if self.wake_word in transcript:
+                                print(f"🎉 Interruption detected: '{transcript}'")
+                                interruption_queue.put(True)
+                                stop_event.set()
+                                break
+
+                except Exception as e:
+                    if not stop_event.is_set():
+                        print(f"Interruption listening error: {e}")
+                        time.sleep(0.1)
+
+            stream.close()
+
+        except Exception as e:
+            print(f"Interruption listener setup error: {e}")
+
+    def split_into_sentences(self, text):
+        """Split text into sentences for chunked speaking"""
+        # Simple sentence splitting
+        import re
+
+        # Split on periods, exclamation marks, question marks
+        sentences = re.split(r'[.!?]+', text)
+
+        # Clean up and filter empty sentences
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        # If no sentences found, return original text
+        if not sentences:
+            return [text]
+
+        # Rejoin sentences that are too short (likely abbreviations)
+        cleaned_sentences = []
+        current_sentence = ""
+
+        for sentence in sentences:
+            current_sentence += sentence + ". "
+
+            # If sentence is reasonable length or we're at the end, add it
+            if len(current_sentence.split()) >= 5 or sentence == sentences[-1]:
+                cleaned_sentences.append(current_sentence.strip())
+                current_sentence = ""
+
+        return cleaned_sentences if cleaned_sentences else [text]
 
     def get_time(self):
         """Get current time - local function"""
@@ -184,7 +323,9 @@ class VoiceAssistant:
     def request_online_permission(self, query_type="search"):
         """Request explicit permission before any online activity"""
         permission_text = f"I cannot answer that from my local resources. Do you want me to check online?"
-        self.speak(permission_text)
+
+        # Use non-interruptible speech for permission requests (they're short)
+        self.speak(permission_text, allow_interruption=False)
         print(f"🌐 Requesting online permission for: {query_type}")
 
         # Record user response
@@ -212,16 +353,103 @@ class VoiceAssistant:
             return False
 
     def web_search(self, query):
-        """Launch web search - requires explicit permission"""
+        """Enhanced web search - offers to read results or open browser"""
         # Request permission first
         if not self.request_online_permission("web search"):
             return "Okay, staying local. Is there anything else I can help you with?"
 
+        # Offer two options
+        options_text = "Would you like me to read you the answer, or open a browser window?"
+        self.speak(options_text, allow_interruption=False)  # Short question
+        print(f"🤔 Asking user preference: read vs browse")
+
+        # Record user response
+        response_audio = self.record_command(duration=4)
+        if response_audio:
+            response_text = self.speech_to_text(response_audio)
+            response_lower = response_text.lower().strip()
+            print(f"📝 User choice: '{response_text}'")
+
+            # Check what user wants
+            read_words = ['read', 'tell', 'say', 'speak', 'answer']
+            browse_words = ['browser', 'open', 'window', 'firefox', 'chrome']
+
+            if any(word in response_lower for word in read_words):
+                print("📖 User chose: read results")
+                return self.fetch_and_read_results(query)
+            elif any(word in response_lower for word in browse_words):
+                print("🌐 User chose: open browser")
+                return self.open_browser_search(query)
+            else:
+                # Default to reading if unclear
+                print("❓ Unclear response - defaulting to read results")
+                return self.fetch_and_read_results(query)
+        else:
+            print("❌ No response - defaulting to read results")
+            return self.fetch_and_read_results(query)
+
+    def fetch_and_read_results(self, query):
+        """Fetch web search results and read them aloud"""
         try:
-            subprocess.run(['firefox', f'https://duckduckgo.com/?q={query}'],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return f"Opening web search for {query}"
-        except:
+            print(f"🔍 Searching for: {query}")
+            self.speak("Let me search for that", allow_interruption=False)
+
+            # Use DuckDuckGo instant answers API (privacy-focused)
+            encoded_query = urllib.parse.quote_plus(query)
+            search_url = f"https://api.duckduckgo.com/?q={encoded_query}&format=json&no_html=1&skip_disambig=1"
+
+            response = requests.get(search_url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+
+                # Try to get a direct answer
+                answer = data.get('AbstractText', '').strip()
+                if not answer:
+                    answer = data.get('Answer', '').strip()
+
+                if answer:
+                    # Clean up the answer for speech
+                    clean_answer = answer.replace('\n', ' ').replace('  ', ' ')
+                    # Limit length for speech
+                    if len(clean_answer) > 300:
+                        clean_answer = clean_answer[:300] + "... would you like me to open a browser for more details?"
+
+                    print(f"📖 Found answer: {clean_answer}")
+                    return clean_answer
+                else:
+                    # No direct answer found, offer browser instead
+                    print("❓ No direct answer found")
+                    fallback_msg = "I couldn't find a direct answer. Let me open a browser search for you."
+                    self.speak(fallback_msg, allow_interruption=False)
+                    time.sleep(1)  # Brief pause
+                    return self.open_browser_search(query)
+            else:
+                print(f"❌ Search API error: {response.status_code}")
+                return self.open_browser_search(query)
+
+        except Exception as e:
+            print(f"🔍 Search error: {e}")
+            error_msg = "I had trouble searching. Let me open a browser for you instead."
+            self.speak(error_msg, allow_interruption=False)
+            time.sleep(1)
+            return self.open_browser_search(query)
+
+    def open_browser_search(self, query):
+        """Open browser with search results"""
+        try:
+            print("🌐 Opening web browser...")
+            # Use Popen to avoid blocking
+            encoded_query = urllib.parse.quote_plus(query)
+            subprocess.Popen(['firefox', f'https://duckduckgo.com/?q={encoded_query}'],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+
+            # Give the browser time to start
+            time.sleep(2)
+
+            return f"Opened browser search for {query}"
+        except Exception as e:
+            print(f"Browser launch error: {e}")
             return "Could not open web browser"
 
     def query_ai_local_only(self, text):
@@ -391,69 +619,96 @@ class VoiceAssistant:
             return ""
 
     def listen_for_wake_word(self):
-        """Continuously listen for the wake word 'ziggy'"""
-        try:
-            recognizer = vosk.KaldiRecognizer(self.vosk_model, self.sample_rate)
+        """Continuously listen for the wake word 'ziggy' with auto-recovery"""
+        max_retries = 3
+        retry_count = 0
 
-            stream = self.audio.open(
-                format=self.format,
-                channels=self.channels,
-                rate=self.sample_rate,
-                input=True,
-                frames_per_buffer=self.chunk_size
-            )
+        while self.is_listening and retry_count < max_retries:
+            try:
+                recognizer = vosk.KaldiRecognizer(self.vosk_model, self.sample_rate)
 
-            print(f"👂 Listening for wake word '{self.wake_word}'...")
+                # Try to open audio stream with retry logic
+                stream = None
+                for attempt in range(3):
+                    try:
+                        stream = self.audio.open(
+                            format=self.format,
+                            channels=self.channels,
+                            rate=self.sample_rate,
+                            input=True,
+                            frames_per_buffer=self.chunk_size
+                        )
+                        break
+                    except Exception as e:
+                        print(f"Audio stream attempt {attempt + 1} failed: {e}")
+                        time.sleep(1)  # Wait before retry
 
-            while self.is_listening:
-                try:
-                    data = stream.read(self.chunk_size, exception_on_overflow=False)
+                if not stream:
+                    print("❌ Could not open audio stream")
+                    return False
 
-                    if recognizer.AcceptWaveform(data):
-                        result = json.loads(recognizer.Result())
-                        if result.get('text'):
-                            transcript = result['text'].lower().strip()
+                print(f"👂 Listening for wake word '{self.wake_word}'...")
+                retry_count = 0  # Reset retry count on successful stream open
 
-                            # Check for wake word
-                            if self.wake_word in transcript:
-                                print(f"🎉 Wake word detected: '{transcript}'")
-                                stream.close()
-                                return True  # Wake word found
+                while self.is_listening:
+                    try:
+                        data = stream.read(self.chunk_size, exception_on_overflow=False)
 
-                            # Check for shutdown command
-                            if self.shutdown_phrase in transcript:
-                                print(f"🛑 Shutdown command detected: '{transcript}'")
-                                stream.close()
-                                return "shutdown"
+                        if recognizer.AcceptWaveform(data):
+                            result = json.loads(recognizer.Result())
+                            if result.get('text'):
+                                transcript = result['text'].lower().strip()
 
-                except Exception as e:
-                    if self.is_listening:  # Only print error if we're still supposed to be listening
-                        print(f"Listen error: {e}")
-                        time.sleep(0.1)
+                                # Check for wake word
+                                if self.wake_word in transcript:
+                                    print(f"🎉 Wake word detected: '{transcript}'")
+                                    stream.close()
+                                    return True  # Wake word found
 
-            stream.close()
-            return False
+                                # Check for shutdown command
+                                if self.shutdown_phrase in transcript:
+                                    print(f"🛑 Shutdown command detected: '{transcript}'")
+                                    stream.close()
+                                    return "shutdown"
 
-        except Exception as e:
-            print(f"Wake word detection error: {e}")
-            return False
+                    except Exception as e:
+                        if self.is_listening:
+                            print(f"⚠️ Audio read error: {e}")
+                            # Break inner loop to retry stream setup
+                            break
+
+                if stream:
+                    stream.close()
+                return False
+
+            except Exception as e:
+                retry_count += 1
+                print(f"🔄 Wake word detection error (attempt {retry_count}): {e}")
+                if retry_count < max_retries:
+                    print(f"Retrying in 2 seconds...")
+                    time.sleep(2)
+                else:
+                    print("❌ Max retries reached for audio stream")
+                    return False
+
+        return False
 
     def handle_voice_command(self):
         """Handle complete voice interaction after wake word"""
         try:
             self.is_processing = True
-            self.speak("Yes?")  # Acknowledge wake word
+            self.speak("Yes?", allow_interruption=False)  # Short acknowledgment
 
             # Record the user's command
             audio_data = self.record_command()
             if not audio_data:
-                self.speak("I didn't hear anything")
+                self.speak("I didn't hear anything", allow_interruption=False)
                 return
 
             # Convert speech to text
             command_text = self.speech_to_text(audio_data)
             if not command_text:
-                self.speak("I couldn't understand that")
+                self.speak("I couldn't understand that", allow_interruption=False)
                 return
 
             print(f"📝 Command: '{command_text}'")
@@ -462,25 +717,41 @@ class VoiceAssistant:
             route_type, response = self.route_query(command_text)
 
             if route_type == "shutdown":
-                self.speak(response)
+                self.speak(response, allow_interruption=False)
                 self.shutdown()
                 return
 
-            # Speak the response
-            self.speak(response)
-            print(f"✅ Response delivered")
+            # Speak the response with interruption capability for long responses
+            was_interrupted = self.speak(response, allow_interruption=True)
+
+            if was_interrupted:
+                print("🔄 Response was interrupted - processing new command")
+                # Speech was interrupted by "ziggy" - handle the new command
+                self.handle_voice_command()
+                return
+            else:
+                print(f"✅ Response delivered completely")
+
+            # Add a small pause to ensure audio operations complete
+            time.sleep(0.5)
+
+            # For web operations, add extra recovery time
+            if 'browser' in response.lower() or 'search' in response.lower():
+                print("🔄 Allowing extra time for browser operations...")
+                time.sleep(1.5)
 
         except Exception as e:
             print(f"Command handling error: {e}")
-            self.speak("Sorry, I had trouble processing that")
+            self.speak("Sorry, I had trouble processing that", allow_interruption=False)
         finally:
             self.is_processing = False
+            print("👂 Ready to listen for wake word again...")
 
     def startup_message(self):
         """Play welcome message on startup"""
         welcome_msg = "Welcome. Ziggy is ready to assist you."
         print(f"🤖 {welcome_msg}")
-        self.speak(welcome_msg)
+        self.speak(welcome_msg, allow_interruption=False)
 
     def shutdown(self):
         """Gracefully shutdown the voice assistant"""
@@ -516,7 +787,7 @@ class VoiceAssistant:
                 wake_result = self.listen_for_wake_word()
 
                 if wake_result == "shutdown":
-                    self.speak("Okay, bye!")
+                    self.speak("Okay, bye!", allow_interruption=False)
                     self.shutdown()
                 elif wake_result == True:
                     # Wake word detected - handle command
